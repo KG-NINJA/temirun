@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<title>Vector Theremin Scanner</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  :root {
+    color-scheme: dark;
+    --glow: rgba(0, 255, 221, 0.9);
+    --accent: #6ef3ff;
+    --warning: #ff7bdc;
+  }
+  * {
+    box-sizing: border-box;
+  }
+  body {
+    margin: 0;
+    font-family: "Share Tech Mono", "Fira Code", monospace;
+    background: #01010b;
+    color: var(--accent);
+    overflow: hidden;
+  }
+  canvas {
+    width: 100vw;
+    height: 100vh;
+    display: block;
+    cursor: crosshair;
+  }
+  #hud {
+    position: fixed;
+    top: 0.8rem;
+    left: 1rem;
+    font-size: clamp(0.9rem, 1.2vw, 1.2rem);
+    letter-spacing: 0.12em;
+    text-shadow: 0 0 6px rgba(0,255,255,0.9);
+    pointer-events: none;
+  }
+  #hint {
+    position: fixed;
+    bottom: 1rem;
+    left: 50%;
+    transform: translateX(-50%);
+    text-align: center;
+    font-size: clamp(0.75rem, 1vw, 1rem);
+    color: rgba(255,255,255,0.8);
+    text-shadow: 0 0 4px rgba(0,255,255,0.6);
+  }
+  #start {
+    position: fixed;
+    inset: 50% auto auto 50%;
+    transform: translate(-50%, -50%);
+    border: 1px solid var(--accent);
+    background: rgba(1,1,15,0.9);
+    color: var(--accent);
+    padding: 0.9rem 1.8rem;
+    font-size: 1.1rem;
+    text-transform: uppercase;
+    letter-spacing: 0.2em;
+    cursor: pointer;
+    box-shadow: 0 0 20px rgba(0,255,221,0.45);
+  }
+  #start:disabled {
+    opacity: 0.4;
+    cursor: progress;
+  }
+  video {
+    display: none;
+  }
+</style>
+</head>
+<body>
+<button id="start">POWER ON</button>
+<canvas id="scope" width="1280" height="720">Vector scope not supported.</canvas>
+<div id="hud">freq — <span id="freq">0</span> Hz<br/>note — <span id="note">--</span><br/>vol — <span id="vol">0.00</span><br/>scan — <span id="status">IDLE</span></div>
+<div id="hint">Webcam + audio permissionが必要です。明るい場所で手や物体を動かし、COCO-SSDに認識させて音程と音量を操作してください。</div>
+<video id="feed" autoplay playsinline muted></video>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+<script>
+const scope = document.getElementById('scope');
+const ctx = scope.getContext('2d');
+const startBtn = document.getElementById('start');
+const freqEl = document.getElementById('freq');
+const noteEl = document.getElementById('note');
+const volEl = document.getElementById('vol');
+const statusEl = document.getElementById('status');
+const video = document.getElementById('feed');
+
+let model;
+let audioCtx;
+let gainNode;
+let oscillator;
+let filter;
+let running = false;
+let lastDetectFrame = 0;
+let predictions = [];
+let logicalWidth = window.innerWidth;
+let logicalHeight = window.innerHeight;
+
+const state = {
+  freq: 0,
+  volume: 0,
+  targetFreq: 0,
+  targetVol: 0,
+  glowPhase: 0,
+  note: '--',
+};
+
+const pitchAssist = {
+  mix: 0.6,
+  extent: 0.8,
+};
+
+const noteNames = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+
+function midiFromFreq(freq) {
+  return 69 + 12 * Math.log2(freq / 440);
+}
+
+function freqFromMidi(midi) {
+  return 440 * 2 ** ((midi - 69) / 12);
+}
+
+function snapToScale(freq) {
+  if (freq <= 0) return 0;
+  const midi = midiFromFreq(freq);
+  const snappedMidi = Math.round(midi);
+  const snappedFreq = freqFromMidi(snappedMidi);
+  const closeness = Math.min(1, pitchAssist.extent * Math.abs(midi - snappedMidi));
+  const mix = Math.max(pitchAssist.mix * (1 - closeness), 0);
+  return freq * (1 - mix) + snappedFreq * mix;
+}
+
+function noteLabel(freq) {
+  if (freq <= 0) return '--';
+  const midi = Math.round(midiFromFreq(freq));
+  const octave = Math.floor(midi / 12) - 1;
+  const name = noteNames[midi % 12];
+  return `${name}${octave}`;
+}
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  logicalWidth = window.innerWidth;
+  logicalHeight = window.innerHeight;
+  scope.width = Math.round(logicalWidth * dpr);
+  scope.height = Math.round(logicalHeight * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+resize();
+window.addEventListener('resize', resize);
+
+async function initAudio() {
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  oscillator = audioCtx.createOscillator();
+  oscillator.type = 'sine';
+  gainNode = audioCtx.createGain();
+  gainNode.gain.value = 0;
+  filter = audioCtx.createBiquadFilter();
+  filter.type = 'lowpass';
+  filter.frequency.value = 600;
+  oscillator.connect(filter).connect(gainNode).connect(audioCtx.destination);
+  oscillator.start();
+}
+
+async function initCamera() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: false,
+    video: {
+      width: { ideal: 640 },
+      height: { ideal: 480 },
+      facingMode: 'user',
+    },
+  });
+  video.srcObject = stream;
+  return new Promise((resolve) => {
+    video.onloadedmetadata = () => {
+      video.play();
+      resolve();
+    };
+  });
+}
+
+function selectController(boxes) {
+  const preferredClasses = ['person', 'handbag', 'cell phone', 'sports ball'];
+  let target = null;
+  for (const pref of preferredClasses) {
+    target = boxes.find((b) => b.class === pref);
+    if (target) break;
+  }
+  if (!target) target = boxes[0];
+  return target;
+}
+
+function updateAudioFromBox(box, vw, vh) {
+  if (!audioCtx) return;
+  if (!box) {
+    state.targetVol = 0;
+    state.note = '--';
+    return;
+  }
+  const [x, y, width, height] = box.bbox;
+  const centerX = x + width / 2;
+  const centerY = y + height / 2;
+  const xRatio = Math.min(Math.max(centerX / vw, 0), 1);
+  const yRatio = 1 - Math.min(Math.max(centerY / vh, 0), 1);
+  const area = (width * height) / (vw * vh);
+  const rawFreq = 180 + xRatio * 900;
+  state.targetFreq = snapToScale(rawFreq);
+  state.targetVol = Math.min(Math.max(yRatio, 0), 1) * 0.8;
+  state.note = noteLabel(state.targetFreq);
+  filter.frequency.value = 400 + area * 1200;
+}
+
+function smoothAudio() {
+  if (!audioCtx) return;
+  const now = audioCtx.currentTime;
+  if (oscillator && state.targetFreq > 0) {
+    oscillator.frequency.cancelScheduledValues(now);
+    oscillator.frequency.linearRampToValueAtTime(state.targetFreq, now + 0.05);
+  }
+  if (gainNode) {
+    gainNode.gain.cancelScheduledValues(now);
+    gainNode.gain.linearRampToValueAtTime(state.targetVol, now + 0.1);
+  }
+}
+
+function drawGrid(time) {
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, logicalWidth, logicalHeight);
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.fillRect(0, 0, logicalWidth, logicalHeight);
+  ctx.strokeStyle = 'rgba(0,255,221,0.35)';
+  ctx.lineWidth = 1;
+  ctx.shadowBlur = 10;
+  ctx.shadowColor = 'rgba(0,255,221,0.8)';
+  const spacing = 80;
+  for (let x = (time / 20) % spacing - spacing; x < logicalWidth; x += spacing) {
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x + logicalHeight * 0.1, logicalHeight);
+    ctx.stroke();
+  }
+  for (let y = 0; y < logicalHeight; y += spacing) {
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(logicalWidth, y);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawScanner() {
+  ctx.save();
+  ctx.strokeStyle = 'rgba(110, 243, 255, 0.8)';
+  ctx.lineWidth = 2;
+  ctx.shadowBlur = 18;
+  ctx.shadowColor = 'rgba(110, 243, 255, 0.9)';
+  const cx = logicalWidth / 2;
+  const cy = logicalHeight / 2;
+  ctx.beginPath();
+  ctx.arc(cx, cy, Math.min(cx, cy) * 0.6, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(0, cy);
+  ctx.lineTo(logicalWidth, cy);
+  ctx.moveTo(cx, 0);
+  ctx.lineTo(cx, logicalHeight);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawPredictions() {
+  if (!predictions.length) return;
+  ctx.save();
+  ctx.shadowBlur = 18;
+  ctx.shadowColor = 'rgba(255, 123, 220, 0.9)';
+  ctx.lineWidth = 2;
+  predictions.forEach((pred) => {
+    const [x, y, w, h] = pred.bbox;
+    const scaleX = logicalWidth / video.videoWidth;
+    const scaleY = logicalHeight / video.videoHeight;
+    const px = x * scaleX;
+    const py = y * scaleY;
+    const pw = w * scaleX;
+    const ph = h * scaleY;
+    ctx.strokeStyle = 'rgba(255, 123, 220, 0.8)';
+    ctx.strokeRect(px, py, pw, ph);
+    ctx.strokeStyle = 'rgba(255,255,255,0.8)';
+    ctx.beginPath();
+    ctx.moveTo(px + pw / 2, py);
+    ctx.lineTo(px + pw / 2, py + ph);
+    ctx.moveTo(px, py + ph / 2);
+    ctx.lineTo(px + pw, py + ph / 2);
+    ctx.stroke();
+    ctx.font = '14px Share Tech Mono, monospace';
+    ctx.fillStyle = 'rgba(255,255,255,0.8)';
+    ctx.fillText(`${pred.class} ${(pred.score * 100).toFixed(1)}%`, px + 4, py - 6);
+  });
+  ctx.restore();
+}
+
+function drawWave(time) {
+  ctx.save();
+  ctx.shadowBlur = 12;
+  ctx.shadowColor = 'rgba(0,255,170,0.9)';
+  ctx.strokeStyle = 'rgba(0,255,170,0.8)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  const width = logicalWidth;
+  const height = logicalHeight * 0.18;
+  const baseY = logicalHeight * 0.85;
+  const frequency = 0.002 * state.freq;
+  for (let x = 0; x <= width; x += 6) {
+    const amp = height * state.volume;
+    const y = baseY + Math.sin(x * frequency + time * 0.01) * amp;
+    if (x === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+async function detectLoop() {
+  if (!running || !model || video.readyState < 2) return;
+  const now = performance.now();
+  if (now - lastDetectFrame > 120) {
+    predictions = await model.detect(video);
+    const controller = selectController(predictions);
+    updateAudioFromBox(controller, video.videoWidth, video.videoHeight);
+    statusEl.textContent = controller ? controller.class.toUpperCase() : 'SEARCHING';
+    lastDetectFrame = now;
+  }
+  smoothAudio();
+}
+
+function render(time) {
+  drawGrid(time);
+  drawScanner();
+  drawPredictions();
+  drawWave(time);
+  freqEl.textContent = state.targetFreq.toFixed(0);
+  noteEl.textContent = state.note;
+  volEl.textContent = state.targetVol.toFixed(2);
+  state.freq += (state.targetFreq - state.freq) * 0.1;
+  state.volume += (state.targetVol - state.volume) * 0.15;
+  state.glowPhase += 0.01;
+  requestAnimationFrame(render);
+}
+
+async function mainLoop() {
+  if (!running) return;
+  await detectLoop();
+  requestAnimationFrame(mainLoop);
+}
+
+async function start() {
+  startBtn.disabled = true;
+  statusEl.textContent = 'BOOTING MODEL';
+  try {
+    await Promise.all([initAudio(), initCamera()]);
+    model = await cocoSsd.load();
+    running = true;
+    statusEl.textContent = 'ACTIVE';
+    startBtn.remove();
+    requestAnimationFrame(render);
+    mainLoop();
+  } catch (err) {
+    console.error(err);
+    statusEl.textContent = 'ERROR';
+    startBtn.disabled = false;
+    alert('起動に失敗しました。Webカメラ/Audio権限とHTTPS接続を確認してください。');
+  }
+}
+
+startBtn.addEventListener('click', start);
+</script>
+</body>
+</html>
